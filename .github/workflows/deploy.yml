@@ -32,11 +32,12 @@ jobs:
 
     - name: Update manifest
       run: |
-        git clone https://Zeeshaanx:${{ secrets.GH_TOKEN }}@github.com/Zeeshaanx/k3s-ready-ARGO-cicd.git
+        git clone https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/Zeeshaanx/k3s-ready-ARGO-cicd.git
         cd k3s-ready-ARGO-cicd
         sed -i "s|aisec-digital-risk:.*|aisec-digital-risk:${{ github.sha }}|g" apps/aisec-digital-risk/deployment.yaml
         git config user.email "ci@aisec.com"
         git config user.name "CI"
         git add .
         git commit -m "update aisec-digital-risk image to ${{ github.sha }}"
+        git remote set-url origin https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/Zeeshaanx/k3s-ready-ARGO-cicd.git
         git push origin main
