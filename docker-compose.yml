@@ -1,0 +1,130 @@
+version: '3.8'
+
+services:
+  # ──────────────── PostgreSQL ────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: media_intel_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-media_intel}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-media_intel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - mediaintel
+
+  # ──────────────── SearXNG Search ────────────────
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: searxng
+    restart: always
+    networks:
+      - mediaintel
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./searxng:/etc/searxng:ro
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+      - SEARXNG_SECRET=a_secure_random_string_here_for_sessions
+    depends_on:
+      - redis
+
+  redis:
+    image: docker.io/redis:alpine
+    container_name: redis
+    restart: always
+    networks:
+      - mediaintel
+    command: redis-server --save "" --appendonly no
+
+  # ──────────────── Database Schema Migration Step ────────────────
+  db_init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: media_intel_db_init
+    command: python -c "import asyncio; from app.core.database import create_all_tables; asyncio.run(create_all_tables())"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-media_intel}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-media_intel}
+      # ── Overriding pool limits here fixes the Ansible exit 1 error ──
+      DB_POOL_SIZE: 1        # 👈 Forces migration runner to use exactly 1 connection
+      DB_MAX_OVERFLOW: 0     # 👈 Prevents spawning extra threads/connections
+    networks:
+      - mediaintel
+
+  # ──────────────── FastAPI App ────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: media_intel_api
+    restart: unless-stopped
+    # ── Fixing duplicate APScheduler triggers ──
+    # If your Dockerfile's default CMD uses --workers 4, you can force it to 1 here:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      searxng:
+        condition: service_started
+      db_init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-media_intel}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-media_intel}
+      WHOOGLE_URL: http://whoogle:5000
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    networks:
+      - mediaintel
+
+  # ──────────────── Nginx Reverse Proxy ────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: media_intel_nginx
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - mediaintel
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  mediaintel:
+    driver: bridge

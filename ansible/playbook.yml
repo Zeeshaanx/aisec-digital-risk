@@ -1,0 +1,260 @@
+---
+- name: Deploy Media Intelligence API (Docker Compose) on Ubuntu EC2
+  hosts: media_intel
+  become: true
+
+  vars:
+    app_root: /home/ubuntu/aisec-digital-risk
+    repo_url: "https://{{ github_token }}@github.com/rikton9/aisec-digital-risk.git"
+    repo_branch: main
+    compose_service_name: aisec-digital-risk
+
+  tasks:
+
+    # ════════════════════════════════════════════
+    #  SYSTEM PREP
+    # ════════════════════════════════════════════
+
+    - name: Create 4 GB swap file (prevents OOM)
+      shell: |
+        if [ ! -f /swapfile ] || [ $(stat -c %s /swapfile 2>/dev/null || echo 0) -lt 4000000000 ]; then
+          swapoff /swapfile 2>/dev/null || true
+          rm -f /swapfile
+          fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+      args:
+        creates: /swapfile
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install prerequisite packages
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - git
+          - htop
+          - unzip
+        state: present
+
+    # ════════════════════════════════════════════
+    #  INSTALL DOCKER ENGINE
+    # ════════════════════════════════════════════
+
+    - name: Add Docker GPG key
+      shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker apt repository
+      shell: |
+        echo \
+          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+          https://download.docker.com/linux/ubuntu \
+          $(lsb_release -cs) stable" \
+          > /etc/apt/sources.list.d/docker.list
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: Install Docker Engine and Compose plugin
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Enable and start Docker
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+    # ════════════════════════════════════════════
+    #  CLONE / UPDATE REPOSITORY (Destructive)
+    # ════════════════════════════════════════════
+
+    - name: Remove previous deployment directory
+      file:
+        path: "{{ app_root }}"
+        state: absent
+
+    - name: Clone repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_root }}"
+        version: "{{ repo_branch }}"
+        force: yes
+      become_user: ubuntu
+
+    # ════════════════════════════════════════════
+    #  WRITE .env FILE (Whoogle updated to SearXNG)
+    # ════════════════════════════════════════════
+
+    - name: Create production .env file
+      copy:
+        dest: "{{ app_root }}/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+        content: |
+          # ═══ App ═══
+          APP_NAME=Media Intelligence API
+          APP_VERSION=1.0.0
+          ENVIRONMENT=production
+          DEBUG=false
+          LOG_LEVEL=INFO
+
+          # ═══ Database ═══
+          POSTGRES_USER={{ postgres_user }}
+          POSTGRES_PASSWORD={{ postgres_password }}
+          POSTGRES_DB={{ postgres_db }}
+          DATABASE_URL=postgresql+asyncpg://{{ postgres_user }}:{{ postgres_password }}@postgres:5432/{{ postgres_db }}
+          DATABASE_URL_SYNC=postgresql://{{ postgres_user }}:{{ postgres_password }}@postgres:5432/{{ postgres_db }}
+          DB_POOL_SIZE=20
+          DB_MAX_OVERFLOW=30
+
+          # ═══ SearXNG ═══
+          SEARXNG_URL=http://searxng:8080
+          SEARXNG_MAX_PAGES=2
+          SEARXNG_QUERY_DELAY=2.0
+
+          # ═══ API Keys ═══
+          OPENAI_API_KEY={{ openai_api_key }}
+
+          # ═══ LLM ═══
+          LLM_MODEL=gpt-5-mini
+          INPUT_COST_PER_1K=0.00025
+          OUTPUT_COST_PER_1K=0.002
+
+          # ═══ Scan Defaults ═══
+          MAX_CONCURRENCY=3
+          MAX_CONTENT_CHARS=50000
+
+    # ════════════════════════════════════════════
+    #  DOCKER COMPOSE – BUILD & START
+    # ════════════════════════════════════════════
+
+    - name: Build Docker images
+      command: docker compose build --no-cache
+      args:
+        chdir: "{{ app_root }}"
+
+    - name: Start all services
+      command: docker compose up -d
+      args:
+        chdir: "{{ app_root }}"
+
+    - name: Wait for API health endpoint
+      uri:
+        url: http://127.0.0.1/aisec-digital-risk/health
+        method: GET
+        status_code: 200
+      register: api_health
+      retries: 30
+      delay: 10
+      until: api_health.status == 200
+
+    # ════════════════════════════════════════════
+    #  SYSTEMD SERVICE (auto-restart on reboot)
+    # ════════════════════════════════════════════
+
+    - name: Create systemd service for docker compose
+      copy:
+        dest: /etc/systemd/system/media-intel.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Media Intelligence API (Docker Compose)
+          Requires=docker.service
+          After=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          User=ubuntu
+          Group=docker
+          WorkingDirectory={{ app_root }}
+          ExecStart=/usr/bin/docker compose up -d --remove-orphans
+          ExecStop=/usr/bin/docker compose down
+          ExecReload=/usr/bin/docker compose up -d --build --remove-orphans
+          TimeoutStartSec=300
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+    - name: Enable media-intel service on boot
+      systemd:
+        name: media-intel
+        enabled: yes
+
+    # ════════════════════════════════════════════
+    #  LOG ROTATION
+    # ════════════════════════════════════════════
+
+    - name: Configure Docker log rotation
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "50m",
+              "max-file": "3"
+            }
+          }
+        mode: "0644"
+      notify: Restart Docker
+
+    # ════════════════════════════════════════════
+    #  FINAL STATUS
+    # ════════════════════════════════════════════
+
+    - name: Show running containers
+      command: docker compose ps
+      args:
+        chdir: "{{ app_root }}"
+      register: compose_status
+
+    - name: Print status
+      debug:
+        msg: "{{ compose_status.stdout_lines }}"
+
+    - name: Deployment complete
+      debug:
+        msg: |
+          ✅ Media Intelligence API deployed successfully with SearXNG backend!
+          🌐 API Base URL: http://{{ ansible_host }}/aisec-digital-risk/
+          📋 Health Check: http://{{ ansible_host }}/aisec-digital-risk/health
+          📋 API Docs:     http://{{ ansible_host }}/aisec-digital-risk/docs
+
+  handlers:
+    - name: Restart Docker
+      systemd:
+        name: docker
+        state: restarted

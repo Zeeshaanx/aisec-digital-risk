@@ -1,0 +1,16 @@
+use_default_settings: true
+
+server:
+  base_url: http://127.0.0.1:8080/
+  secret_key: "a_secure_random_string_here_for_sessions"
+  bind_address: "0.0.0.0"
+  port: 8080
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+redis:
+  url: redis://127.0.0.1:6379/0
