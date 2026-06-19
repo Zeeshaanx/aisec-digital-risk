@@ -1,0 +1,42 @@
+name: Deploy Digital Risk
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Configure AWS
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Login to ECR
+      run: |
+        aws ecr get-login-password --region us-east-1 | \
+        docker login --username AWS --password-stdin 825765396079.dkr.ecr.us-east-1.amazonaws.com
+
+    - name: Build and push
+      run: |
+        docker build -t aisec-digital-risk:latest .
+        docker tag aisec-digital-risk:latest 825765396079.dkr.ecr.us-east-1.amazonaws.com/aisec-digital-risk:latest
+        docker tag aisec-digital-risk:latest 825765396079.dkr.ecr.us-east-1.amazonaws.com/aisec-digital-risk:${{ github.sha }}
+        docker push 825765396079.dkr.ecr.us-east-1.amazonaws.com/aisec-digital-risk:latest
+        docker push 825765396079.dkr.ecr.us-east-1.amazonaws.com/aisec-digital-risk:${{ github.sha }}
+
+    - name: Update manifest
+      run: |
+        git clone https://Zeeshaanx:${{ secrets.GH_TOKEN }}@github.com/Zeeshaanx/k3s-ready-ARGO-cicd.git
+        cd k3s-ready-ARGO-cicd
+        sed -i "s|aisec-digital-risk:.*|aisec-digital-risk:${{ github.sha }}|g" apps/aisec-digital-risk/deployment.yaml
+        git config user.email "ci@aisec.com"
+        git config user.name "CI"
+        git add .
+        git commit -m "update aisec-digital-risk image to ${{ github.sha }}"
+        git push origin main
